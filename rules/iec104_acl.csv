@@ -1,0 +1,3 @@
+ID,TYPE,CATEGORY,IOA,SrcIP,DstIP,DstPort,CommonAddr,MSG
+1110501,45,COMMAND,1,any,any,2404,3,"c_sc_na_1: single command(type id:45)"
+1110502,45,COMMAND,2,any,any,2404,3,"c_sc_na_1: single command(type id:45)"

@@ -48,12 +48,6 @@
 
 void RegisterTemplateRustParsers(void)
 {
-    /* TEMPLATE_START_REMOVE */
-    /* Only register if enabled in config. */
-    if (ConfGetNode("app-layer.protocols.template-rust") == NULL) {
-        return;
-    }
-    /* TEMPLATE_END_REMOVE */
     SCLogNotice("Registring Rust template parser.");
     rs_template_register_parser();
 #ifdef UNITTESTS

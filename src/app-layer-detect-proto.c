@@ -1191,7 +1191,7 @@ static void AppLayerProtoDetectInsertNewProbingParser(AppLayerProtoDetectProbing
         head_pe = &curr_port->sp;
     }
     AppLayerProtoDetectProbingParserElementAppend(head_pe, new_pe);
-
+    SCLogNotice("RUST PP REGISTER ipproto=%" PRIu8 " port=%" PRIu16 " alproto=%" PRIu16 " direction=%" PRIu8 " min=%" PRIu16 " max=%" PRIu16, ipproto, port, alproto, direction, min_depth, max_depth);
     if (curr_port->port == 0) {
         AppLayerProtoDetectProbingParserPort *temp_port = curr_pp->port;
         while (temp_port != NULL && temp_port->port != 0) {
@@ -1492,7 +1492,7 @@ AppProto AppLayerProtoDetectGetProto(AppLayerProtoDetectThreadCtx *tctx,
                                      uint8_t ipproto, uint8_t direction,
                                      bool *reverse_flow)
 {
-    SCEnter();
+            SCLogNotice("RUST GETPROTO ipproto=%" PRIu8 " dir=%" PRIu8 " buflen=%" PRIu32, ipproto, direction, buflen);
     SCLogDebug("buflen %u for %s direction", buflen,
             (direction & STREAM_TOSERVER) ? "toserver" : "toclient");
 
