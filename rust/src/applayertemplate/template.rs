@@ -28,6 +28,7 @@ use std::collections::HashSet;
 use std::sync::{Mutex, Once};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::thread;
 use std::fs;
 
@@ -1071,47 +1072,112 @@ fn opcua_handle_socket_client(mut stream: UnixStream) {
     let _ = stream.write_all(b"\n");
 }
 
-fn opcua_socket_server() -> std::io::Result<()> {
-    match UnixListener::bind(OPCUA_SOCKET_PATH) {
-        Ok(listener) => {
-            for incoming in listener.incoming() {
-                match incoming {
-                    Ok(stream) => {
-                        let result = thread::Builder::new()
-                            .name("opcua-socket-client".to_string())
-                            .spawn(move || {
-                                opcua_handle_socket_client(stream);
-                            });
+fn opcua_prepare_socket_path() -> std::io::Result<()> {
+	match fs::symlink_metadata(OPCUA_SOCKET_PATH) {
+		Ok(metadata) => {
+			if !metadata.file_type().is_socket() {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"OPC-UA socket path exists but is not a socket",
+				));
+			}
 
-                        if let Err(error) = result {
-                            eprintln!(
-                                "OPC-UA socket client thread failed: {}",
-                                error
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("OPC-UA socket accept failed: {}", error);
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::AddrInUse {
-                // Do not remove a socket that might belong to
-                // another running Suricata instance.
-                eprintln!(
-                    "OPC-UA socket path already exists: {}",
-                    OPCUA_SOCKET_PATH
-                );
-            }
+			match UnixStream::connect(OPCUA_SOCKET_PATH) {
+				Ok(_stream) => {
+					return Err(std::io::Error::new(
+						std::io::ErrorKind::AddrInUse,
+						"OPC-UA socket already has an active listener",
+					));
+				}
+				Err(error)
+					if error.kind()
+						== std::io::ErrorKind::ConnectionRefused =>
+				{
+					// No listener accepted the connection.
+					// Remove the stale socket file.
+					fs::remove_file(OPCUA_SOCKET_PATH)?;
+				}
+				Err(error) => {
+					// Do not remove the socket when its state
+					// cannot be established safely.
+					return Err(error);
+				}
+			}
+		}
+		Err(error)
+			if error.kind() == std::io::ErrorKind::NotFound =>
+		{
+			// No existing socket; proceed with binding.
+		}
+		Err(error) => return Err(error),
+	}
 
-            return Err(error);
-        }
-    }
-
-    Ok(())
+	Ok(())
 }
+
+fn opcua_set_socket_permissions() -> std::io::Result<()> {
+	let path = CString::new(OPCUA_SOCKET_PATH).unwrap();
+
+	// Keep the owner as root and set the group to www (GID 80).
+	let result = unsafe {
+		libc::chown(
+			path.as_ptr(),
+			!0 as libc::uid_t,
+			80 as libc::gid_t,
+		)
+	};
+
+	if result != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+
+	fs::set_permissions(
+		OPCUA_SOCKET_PATH,
+		fs::Permissions::from_mode(0o660),
+	)?;
+
+	Ok(())
+}
+
+fn opcua_socket_server() -> std::io::Result<()> {
+	opcua_prepare_socket_path()?;
+
+	let listener = UnixListener::bind(OPCUA_SOCKET_PATH)?;
+
+	if let Err(error) = opcua_set_socket_permissions() {
+		drop(listener);
+		let _ = fs::remove_file(OPCUA_SOCKET_PATH);
+		return Err(error);
+	}
+
+	for incoming in listener.incoming() {
+		match incoming {
+			Ok(stream) => {
+				let result = thread::Builder::new()
+					.name("opcua-socket-client".to_string())
+					.spawn(move || {
+						opcua_handle_socket_client(stream);
+					});
+
+				if let Err(error) = result {
+					eprintln!(
+						"OPC-UA socket client thread failed: {}",
+						error
+					);
+				}
+			}
+			Err(error) => {
+				eprintln!(
+					"OPC-UA socket accept failed: {}",
+					error
+				);
+			}
+		}
+	}
+
+	Ok(())
+}
+
 
 fn opcua_start_socket_server() {
     OPCUA_SOCKET_INIT.call_once(|| {
@@ -1771,7 +1837,7 @@ pub unsafe extern "C" fn rs_template_register_parser() {
     {
         let alproto = AppLayerRegisterProtocolDetection(&parser, 1);
         ALPROTO_TEMPLATE = alproto;
-        
+
         if AppLayerParserConfParserEnabled(
             ip_proto_str.as_ptr(),
             parser.name,
