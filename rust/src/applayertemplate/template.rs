@@ -25,6 +25,7 @@ use std::ffi::CString;
 use nom;
 use super::parser;
 use std::collections::HashSet;
+use std::sync::{Mutex, Once};
 
 fn opcua_message_type(input: &[u8]) -> &str {
     if input.len() < 3 { return "???"; }
@@ -516,14 +517,8 @@ fn opcua_extract_read_request_nodeids(frame: &[u8]) {
 
         let nodeid_end = p;
 
-        unsafe {
-            if OPCUA_NODEIDS.is_none() {
-                OPCUA_NODEIDS = Some(HashSet::new());
-            }
-
-            if let Some(ref mut nodeids) = OPCUA_NODEIDS {
-                nodeids.insert(nodeid.clone());
-            }
+        if let Ok(mut nodeids) = opcua_nodeids().lock() {
+            nodeids.insert(nodeid.clone());
         }
 
         SCLogNotice!(
@@ -824,15 +819,9 @@ fn opcua_extract_nodeids(frame: &[u8]) {
             if let Some((nodeid, used)) = opcua_decode_nodeid(frame, p) {
                 SCLogNotice!("RUST OPCUA NODEID {:?}", nodeid);
 
-                unsafe {
-                    if OPCUA_NODEIDS.is_none() {
-                        OPCUA_NODEIDS = Some(HashSet::new());
-                    }
-
-                    if let Some(ref mut nodeids) = OPCUA_NODEIDS {
-                        nodeids.insert(nodeid.clone());
-                    }
-                }
+            if let Ok(mut nodeids) = opcua_nodeids().lock() {
+                nodeids.insert(nodeid.clone());
+            }
 
                 p += used;
             } else {
@@ -976,7 +965,21 @@ enum OpcUaNodeId {
     ByteString { ns: u16, id: Vec<u8> },
 }
 
-static mut OPCUA_NODEIDS: Option<HashSet<OpcUaNodeId>> = None;
+static OPCUA_NODEIDS_INIT: Once = Once::new();
+
+static mut OPCUA_NODEIDS: Option<Mutex<HashSet<OpcUaNodeId>>> = None;
+
+fn opcua_nodeids() -> &'static Mutex<HashSet<OpcUaNodeId>> {
+    OPCUA_NODEIDS_INIT.call_once(|| {
+        unsafe {
+            OPCUA_NODEIDS = Some(Mutex::new(HashSet::new()));
+        }
+    });
+
+    unsafe {
+        OPCUA_NODEIDS.as_ref().unwrap()
+    }
+}
 
 pub struct TemplateState {
     tx_id: u64,
