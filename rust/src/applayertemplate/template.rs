@@ -26,6 +26,10 @@ use nom;
 use super::parser;
 use std::collections::HashSet;
 use std::sync::{Mutex, Once};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::thread;
+use std::fs;
 
 fn opcua_message_type(input: &[u8]) -> &str {
     if input.len() < 3 { return "???"; }
@@ -981,6 +985,150 @@ fn opcua_nodeids() -> &'static Mutex<HashSet<OpcUaNodeId>> {
     }
 }
 
+static OPCUA_SOCKET_INIT: Once = Once::new();
+
+const OPCUA_SOCKET_PATH: &str = "/var/run/mapcs-opcua.sock";
+
+fn opcua_nodeid_to_json(nodeid: &OpcUaNodeId) -> String {
+    match nodeid {
+        OpcUaNodeId::Numeric { ns, id } => {
+            format!(
+                "{{\"type\":\"Numeric\",\"ns\":{},\"id\":{}}}",
+                ns, id
+            )
+        }
+        OpcUaNodeId::String { ns, id } => {
+            let escaped = id
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+
+            format!(
+                "{{\"type\":\"String\",\"ns\":{},\"id\":\"{}\"}}",
+                ns, escaped
+            )
+        }
+        OpcUaNodeId::Guid { ns, id } => {
+            let hex: String = id
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+
+            format!(
+                "{{\"type\":\"Guid\",\"ns\":{},\"id\":\"{}\"}}",
+                ns, hex
+            )
+        }
+        OpcUaNodeId::ByteString { ns, id } => {
+            let hex: String = id
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+
+            format!(
+                "{{\"type\":\"ByteString\",\"ns\":{},\"id\":\"{}\"}}",
+                ns, hex
+            )
+        }
+    }
+}
+
+fn opcua_nodeids_json() -> String {
+    if let Ok(nodeids) = opcua_nodeids().lock() {
+        let entries: Vec<String> = nodeids
+            .iter()
+            .map(opcua_nodeid_to_json)
+            .collect();
+
+        format!("[{}]", entries.join(","))
+    } else {
+        "[]".to_string()
+    }
+}
+
+fn opcua_handle_socket_client(mut stream: UnixStream) {
+    let reader_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let mut reader = BufReader::new(reader_stream);
+    let mut request = String::new();
+
+    if reader.read_line(&mut request).is_err() {
+        return;
+    }
+
+    let response = if request.trim() == "GET_NODEIDS" {
+        opcua_nodeids_json()
+    } else {
+        "{\"error\":\"unknown command\"}".to_string()
+    };
+
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.write_all(b"\n");
+}
+
+fn opcua_socket_server() -> std::io::Result<()> {
+    match UnixListener::bind(OPCUA_SOCKET_PATH) {
+        Ok(listener) => {
+            for incoming in listener.incoming() {
+                match incoming {
+                    Ok(stream) => {
+                        let result = thread::Builder::new()
+                            .name("opcua-socket-client".to_string())
+                            .spawn(move || {
+                                opcua_handle_socket_client(stream);
+                            });
+
+                        if let Err(error) = result {
+                            eprintln!(
+                                "OPC-UA socket client thread failed: {}",
+                                error
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("OPC-UA socket accept failed: {}", error);
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::AddrInUse {
+                // Do not remove a socket that might belong to
+                // another running Suricata instance.
+                eprintln!(
+                    "OPC-UA socket path already exists: {}",
+                    OPCUA_SOCKET_PATH
+                );
+            }
+
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+fn opcua_start_socket_server() {
+    OPCUA_SOCKET_INIT.call_once(|| {
+        let result = thread::Builder::new()
+            .name("opcua-socket-server".to_string())
+            .spawn(|| {
+                if let Err(error) = opcua_socket_server() {
+                    eprintln!("OPC-UA socket server failed: {}", error);
+                }
+            });
+
+        if let Err(error) = result {
+            eprintln!("OPC-UA socket thread failed: {}", error);
+        }
+    });
+}
+
 pub struct TemplateState {
     tx_id: u64,
     request_buffer: Vec<u8>,
@@ -1623,12 +1771,14 @@ pub unsafe extern "C" fn rs_template_register_parser() {
     {
         let alproto = AppLayerRegisterProtocolDetection(&parser, 1);
         ALPROTO_TEMPLATE = alproto;
+        
         if AppLayerParserConfParserEnabled(
             ip_proto_str.as_ptr(),
             parser.name,
         ) != 0
         {
             let _ = AppLayerRegisterParser(&parser, alproto);
+            opcua_start_socket_server();
         }
         SCLogNotice!("Rust template parser registered.");
     } else {
