@@ -522,8 +522,10 @@ fn opcua_extract_read_request_nodeids(frame: &[u8]) {
 
         let nodeid_end = p;
 
-        if let Ok(mut nodeids) = opcua_nodeids().lock() {
-            nodeids.insert(nodeid.clone());
+        if nodeid_namespace(&nodeid) != 0 {
+            if let Ok(mut nodeids) = opcua_nodeids().lock() {
+                nodeids.insert(nodeid.clone());
+            }
         }
 
         SCLogNotice!(
@@ -824,8 +826,10 @@ fn opcua_extract_nodeids(frame: &[u8]) {
             if let Some((nodeid, used)) = opcua_decode_nodeid(frame, p) {
                 SCLogNotice!("RUST OPCUA NODEID {:?}", nodeid);
 
-            if let Ok(mut nodeids) = opcua_nodeids().lock() {
-                nodeids.insert(nodeid.clone());
+            if nodeid_namespace(&nodeid) != 0 {
+                if let Ok(mut nodeids) = opcua_nodeids().lock() {
+                    nodeids.insert(nodeid.clone());
+                }
             }
 
                 p += used;
@@ -970,6 +974,15 @@ enum OpcUaNodeId {
     ByteString { ns: u16, id: Vec<u8> },
 }
 
+fn nodeid_namespace(nodeid: &OpcUaNodeId) -> u16 {
+    match nodeid {
+        OpcUaNodeId::Numeric { ns, .. } => *ns,
+        OpcUaNodeId::String { ns, .. } => *ns,
+        OpcUaNodeId::Guid { ns, .. } => *ns,
+        OpcUaNodeId::ByteString { ns, .. } => *ns,
+    }
+}
+
 static OPCUA_NODEIDS_INIT: Once = Once::new();
 
 static mut OPCUA_NODEIDS: Option<Mutex<HashSet<OpcUaNodeId>>> = None;
@@ -986,9 +999,16 @@ fn opcua_nodeids() -> &'static Mutex<HashSet<OpcUaNodeId>> {
     }
 }
 
-static OPCUA_SOCKET_INIT: Once = Once::new();
+static OPCUA_SOCKET_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-const OPCUA_SOCKET_PATH: &str = "/var/run/mapcs-opcua.sock";
+static OPCUA_SOCKET_THREAD_ALIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+static OPCUA_PARSER_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+const OPCUA_SOCKET_PATH: &str = "/var/run/mapcs-opcua-test.sock";
 
 fn opcua_nodeid_to_json(nodeid: &OpcUaNodeId) -> String {
     match nodeid {
@@ -1050,16 +1070,33 @@ fn opcua_nodeids_json() -> String {
 }
 
 fn opcua_handle_socket_client(mut stream: UnixStream) {
+    SCLogNotice!("OPC-UA socket: client handler started");
+
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
-        Err(_) => return,
+        Err(e) => {
+            SCLogNotice!("OPC-UA socket: try_clone failed: {}", e);
+            return;
+        }
     };
 
     let mut reader = BufReader::new(reader_stream);
     let mut request = String::new();
 
-    if reader.read_line(&mut request).is_err() {
-        return;
+    match reader.read_line(&mut request) {
+        Ok(n) => {
+            SCLogNotice!(
+                "OPC-UA socket: read {} bytes, request={:?}",
+                n, request
+            );
+            if n == 0 {
+                return;
+            }
+        }
+        Err(e) => {
+            SCLogNotice!("OPC-UA socket: read_line failed: {}", e);
+            return;
+        }
     }
 
     let response = if request.trim() == "GET_NODEIDS" {
@@ -1068,8 +1105,12 @@ fn opcua_handle_socket_client(mut stream: UnixStream) {
         "{\"error\":\"unknown command\"}".to_string()
     };
 
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.write_all(b"\n");
+    SCLogNotice!("OPC-UA socket: response length={}", response.len());
+
+    match stream.write_all(format!("{}\n", response).as_bytes()) {
+        Ok(()) => SCLogNotice!("OPC-UA socket: response write succeeded"),
+        Err(e) => SCLogNotice!("OPC-UA socket: response write failed: {}", e),
+    }
 }
 
 fn opcua_prepare_socket_path() -> std::io::Result<()> {
@@ -1140,59 +1181,194 @@ fn opcua_set_socket_permissions() -> std::io::Result<()> {
 }
 
 fn opcua_socket_server() -> std::io::Result<()> {
-	opcua_prepare_socket_path()?;
+    SCLogNotice!("OPC-UA socket: before prepare_socket_path");
 
-	let listener = UnixListener::bind(OPCUA_SOCKET_PATH)?;
+    opcua_prepare_socket_path()?;
 
-	if let Err(error) = opcua_set_socket_permissions() {
-		drop(listener);
-		let _ = fs::remove_file(OPCUA_SOCKET_PATH);
-		return Err(error);
-	}
+    SCLogNotice!("OPC-UA socket: after prepare_socket_path");
+    SCLogNotice!("OPC-UA socket: before UnixListener::bind");
 
-	for incoming in listener.incoming() {
-		match incoming {
-			Ok(stream) => {
-				let result = thread::Builder::new()
-					.name("opcua-socket-client".to_string())
-					.spawn(move || {
-						opcua_handle_socket_client(stream);
-					});
+    let listener = UnixListener::bind(OPCUA_SOCKET_PATH)?;
 
-				if let Err(error) = result {
-					eprintln!(
-						"OPC-UA socket client thread failed: {}",
-						error
-					);
-				}
-			}
-			Err(error) => {
-				eprintln!(
-					"OPC-UA socket accept failed: {}",
-					error
-				);
-			}
-		}
-	}
+    SCLogNotice!("OPC-UA socket: after UnixListener::bind");
+    SCLogNotice!("OPC-UA socket: before set_socket_permissions");
 
-	Ok(())
+    if let Err(error) = opcua_set_socket_permissions() {
+        SCLogNotice!(
+            "OPC-UA socket: set_socket_permissions failed: {}",
+            error
+        );
+        drop(listener);
+        let _ = fs::remove_file(OPCUA_SOCKET_PATH);
+        return Err(error);
+    }
+
+    SCLogNotice!("OPC-UA socket: permissions set; entering accept loop");
+
+   SCLogNotice!("OPC-UA socket: entering explicit accept loop");
+
+    loop {
+        SCLogNotice!("OPC-UA socket: waiting for accept");
+
+        let accept_result = listener.accept();
+
+        SCLogNotice!("OPC-UA socket: accept returned");
+
+        match accept_result {
+            Ok((stream, _address)) => {
+                SCLogNotice!("OPC-UA socket: accept succeeded");
+
+                let result = thread::Builder::new()
+                    .name("opcua-socket-client".to_string())
+                    .spawn(move || {
+                        opcua_handle_socket_client(stream);
+                    });
+
+                if let Err(error) = result {
+                    SCLogNotice!(
+                        "OPC-UA socket client thread failed: {}",
+                        error
+                    );
+                }
+            }
+            Err(error) => {
+                SCLogNotice!(
+                    "OPC-UA socket accept failed; restarting server: {}",
+                    error
+                );
+                return Err(error);
+            }
+        }
+    }
+    SCLogNotice!("OPC-UA socket: accept loop ended");
+    Ok(())
 }
 
 
-fn opcua_start_socket_server() {
-    OPCUA_SOCKET_INIT.call_once(|| {
-        let result = thread::Builder::new()
-            .name("opcua-socket-server".to_string())
-            .spawn(|| {
-                if let Err(error) = opcua_socket_server() {
-                    eprintln!("OPC-UA socket server failed: {}", error);
-                }
-            });
+fn opcua_socket_heartbeat() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
-        if let Err(error) = result {
-            eprintln!("OPC-UA socket thread failed: {}", error);
+    loop {
+        let alive = OPCUA_SOCKET_THREAD_ALIVE.load(Ordering::SeqCst);
+
+        SCLogNotice!(
+            "OPC-UA socket heartbeat: server_thread_alive={}",
+            alive
+        );
+
+        thread::sleep(Duration::from_secs(10));
+    }
+}
+
+
+#[no_mangle]
+pub extern "C" fn rs_template_start_socket_server() {
+    use std::sync::atomic::Ordering;
+
+    if OPCUA_PARSER_ENABLED.load(Ordering::SeqCst) {
+        opcua_start_socket_server();
+    } else {
+        SCLogNotice!(
+            "OPC-UA socket: parser disabled; socket server not started."
+        );
+    }
+}
+
+fn opcua_start_socket_server() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    SCLogNotice!("OPC-UA socket: startup function entered.");
+
+    // Prevent duplicate socket-server threads.
+    if OPCUA_SOCKET_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        SCLogNotice!("OPC-UA socket server already running.");
+        return;
+    }
+
+    // Start one heartbeat thread to report the socket thread's state.
+    let heartbeat_result = thread::Builder::new()
+        .name("opcua-socket-heartbeat".to_string())
+        .spawn(|| {
+            loop {
+                SCLogNotice!("OPC-UA heartbeat: tick");
+
+                thread::sleep(Duration::from_secs(10));
+
+                SCLogNotice!("OPC-UA heartbeat: woke after 10 seconds");
+            }
+        });
+
+    if let Err(error) = heartbeat_result {
+        SCLogNotice!(
+            "OPC-UA socket heartbeat thread spawn failed: {}",
+            error
+        );
+    }
+
+    // Start the socket-server thread.
+    let result = thread::Builder::new()
+        .name("opcua-socket-server".to_string())
+        .spawn(|| {
+            OPCUA_SOCKET_THREAD_ALIVE.store(true, Ordering::SeqCst);
+
+            SCLogNotice!("OPC-UA socket: server thread entered.");
+
+            // Retry the socket server if it returns an error or panics.
+            loop {
+                SCLogNotice!("OPC-UA socket server starting.");
+
+                let outcome = std::panic::catch_unwind(
+                    std::panic::AssertUnwindSafe(|| opcua_socket_server()),
+                );
+
+                match outcome {
+                    Ok(Ok(())) => {
+                        SCLogNotice!(
+                            "OPC-UA socket server stopped; retrying in 5 seconds."
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        SCLogNotice!(
+                            "OPC-UA socket server failed: {}; retrying in 5 seconds.",
+                            error
+                        );
+                    }
+                    Err(_) => {
+                        SCLogNotice!(
+                            "OPC-UA socket server panicked; retrying in 5 seconds."
+                        );
+                    }
+                }
+
+                thread::sleep(Duration::from_secs(5));
+            }
+
+            // Unreachable while the retry loop above remains unconditional.
+            // These flags are intentionally not reset here: the thread
+            // is designed to retry indefinitely.
+        });
+
+    match result {
+        Ok(_handle) => {
+            SCLogNotice!(
+                "OPC-UA socket: server thread spawn returned successfully."
+            );
         }
-    });
+        Err(error) => {
+            SCLogNotice!(
+                "OPC-UA socket thread spawn failed: {}",
+                error
+            );
+
+            OPCUA_SOCKET_RUNNING.store(false, Ordering::SeqCst);
+            OPCUA_SOCKET_THREAD_ALIVE.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 pub struct TemplateState {
@@ -1844,7 +2020,7 @@ pub unsafe extern "C" fn rs_template_register_parser() {
         ) != 0
         {
             let _ = AppLayerRegisterParser(&parser, alproto);
-            opcua_start_socket_server();
+            OPCUA_PARSER_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         SCLogNotice!("Rust template parser registered.");
     } else {

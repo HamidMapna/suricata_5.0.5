@@ -38,6 +38,7 @@
 #endif
 
 #include "suricata.h"
+
 #include "decode.h"
 #include "detect.h"
 #include "packet-queue.h"
@@ -118,6 +119,10 @@
 
 #include "app-layer.h"
 #include "app-layer-parser.h"
+
+#ifdef HAVE_RUST
+#include "rust-applayertemplate-template-gen.h"
+#endif
 #include "app-layer-htp.h"
 #include "app-layer-ssl.h"
 #include "app-layer-dns-tcp.h"
@@ -2853,6 +2858,10 @@ static int PostConfLoadedSetup(SCInstance *suri)
 
     if (MayDaemonize(suri) != TM_ECODE_OK)
         SCReturnInt(TM_ECODE_FAILED);
+
+#ifdef HAVE_RUST
+    rs_template_start_socket_server();
+#endif
 
     if (InitSignalHandler(suri) != TM_ECODE_OK)
         SCReturnInt(TM_ECODE_FAILED);
